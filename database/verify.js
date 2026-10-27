@@ -1,0 +1,118 @@
+'use strict';
+require('../src/config/environment')();
+const assert = require('node:assert/strict'), crypto = require('node:crypto');
+const pool = require('../src/config/database');
+async function verify() {
+  const db = await pool.getConnection();
+  try {
+    await db.query("SET time_zone='+00:00'");
+    await db.query("SET SESSION sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'");
+    const names = ['users','faculty_profiles','student_profiles','classes','enrollments','sessions','attendance','session_participants','session_connection_intervals','activity_logs','privacy_notices','privacy_acknowledgements','privacy_requests','privacy_events','privacy_holds'];
+    const [tables] = await db.query('SELECT TABLE_NAME AS name, ENGINE AS engine FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()');
+    for (const name of names) assert(tables.some(t => t.name === name && t.engine === 'InnoDB'));
+    const [keys] = await db.query("SELECT TABLE_NAME AS name FROM information_schema.TABLE_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND CONSTRAINT_TYPE='PRIMARY KEY'");
+    for (const name of names) assert(keys.some(k => k.name === name));
+    const [fks] = await db.query('SELECT TABLE_NAME AS name, REFERENCED_TABLE_NAME AS parent FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL');
+    for (const [child,parent] of [['privacy_acknowledgements','privacy_notices'],['privacy_acknowledgements','student_profiles'],['privacy_requests','student_profiles'],['privacy_requests','classes'],['privacy_events','users'],['privacy_events','student_profiles'],['privacy_events','privacy_requests'],['privacy_events','privacy_notices'],['privacy_holds','student_profiles'],['faculty_profiles','users'],['student_profiles','users'],['classes','faculty_profiles'],['enrollments','classes'],['enrollments','student_profiles'],['sessions','classes'],['attendance','sessions'],['attendance','student_profiles'],['session_participants','attendance'],['activity_logs','attendance'],['activity_logs','sessions'],['session_connection_intervals','session_participants']]) assert(fks.some(f=>f.name===child&&f.parent===parent));
+    const [rules] = await db.query("SELECT DELETE_RULE,UPDATE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE()");
+    assert(rules.every(rule=>rule.DELETE_RULE==='RESTRICT'&&rule.UPDATE_RULE==='RESTRICT'));
+    const [triggers] = await db.query('SELECT TRIGGER_NAME AS name FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE()');
+    assert.equal(triggers.filter(t=>t.name.startsWith('validate_')).length,18,'Validation triggers must exist on MySQL 8.0.13');
+    const [indexes] = await db.query('SELECT TABLE_NAME AS name, INDEX_NAME AS idx, COLUMN_NAME AS col, SEQ_IN_INDEX AS position FROM information_schema.STATISTICS WHERE TABLE_SCHEMA=DATABASE() AND NON_UNIQUE=0 ORDER BY TABLE_NAME,INDEX_NAME,SEQ_IN_INDEX');
+    const expectedUnique={privacy_notices:{PRIMARY:['version']},privacy_acknowledgements:{PRIMARY:['id'],uq_privacy_ack:['student_user_id','notice_version']},privacy_requests:{PRIMARY:['id']},privacy_events:{PRIMARY:['id']},privacy_holds:{PRIMARY:['id']},users:{PRIMARY:['id'],uq_users_email:['email']},faculty_profiles:{PRIMARY:['id'],uq_faculty_user:['user_id'],uq_faculty_id:['faculty_id']},student_profiles:{PRIMARY:['id'],uq_student_user:['user_id'],uq_student_id:['student_id']},classes:{PRIMARY:['id'],uq_class_code:['class_code']},enrollments:{PRIMARY:['id'],uq_enrollment:['class_id','student_user_id']},sessions:{PRIMARY:['id'],uq_live_class:['live_class_id']},attendance:{PRIMARY:['id'],uq_attendance:['session_id','student_user_id']},session_participants:{PRIMARY:['id'],uq_participant:['session_id','student_user_id']},session_connection_intervals:{PRIMARY:['id'],uq_open_interval:['open_participant_id']},activity_logs:{PRIMARY:['id']},schema_migrations:{PRIMARY:['version']}};
+    for(const [table,definitions] of Object.entries(expectedUnique)) for(const [key,columns] of Object.entries(definitions)) assert.deepEqual(indexes.filter(i=>i.name===table&&i.idx===key).map(i=>i.col),columns,`${table}.${key}`);
+    const [composite] = await db.query('SELECT TABLE_NAME AS name, CONSTRAINT_NAME AS constraint_name, COLUMN_NAME AS col, REFERENCED_COLUMN_NAME AS parent_col FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA=DATABASE() AND REFERENCED_TABLE_NAME=? ORDER BY TABLE_NAME,CONSTRAINT_NAME,ORDINAL_POSITION',['attendance']);
+    for(const table of ['session_participants','activity_logs']){const rows=composite.filter(f=>f.name===table);assert.deepEqual(rows.map(f=>f.col),['session_id','student_user_id']);assert.deepEqual(rows.map(f=>f.parent_col),['session_id','student_user_id']);}
+    const [triggerDetails] = await db.query('SELECT TRIGGER_NAME AS name, EVENT_MANIPULATION AS event, EVENT_OBJECT_TABLE AS table_name, ACTION_TIMING AS timing, ACTION_STATEMENT AS body FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=DATABASE()');
+    const migration=require('node:fs').readFileSync(require('node:path').join(__dirname,'migrations','001_initial_schema.sql'),'utf8');
+    for(const match of migration.matchAll(/CREATE TRIGGER (\w+) BEFORE (INSERT|UPDATE) ON (\w+)\s+FOR EACH ROW (BEGIN[\s\S]*?END)\$\$/g)){const found=triggerDetails.find(t=>t.name===match[1]);assert(found);assert.equal(found.event,match[2]);assert.equal(found.table_name,match[3]);assert.equal(found.timing,'BEFORE');assert.equal(found.body.replace(/\s+/g,''),match[4].replace(/\s+/g,''));}
+    console.log('PASS: exact primary/unique index columns, composite roster FK column order and installed trigger bodies.');
+    console.log('PASS: tables, primary keys, foreign-key relationships, restrictive history preservation and 18 validation triggers.');
+    const before = {};
+    for (const name of names) { const [[row]]=await db.query(`SELECT COUNT(*) AS count FROM \`${name}\``); before[name]=row.count; }
+    await db.beginTransaction();
+    const token=crypto.randomUUID(), hash='$scrypt$'+crypto.randomBytes(16).toString('hex')+'$'+crypto.scryptSync(crypto.randomBytes(32),crypto.randomBytes(16),32).toString('hex');
+    const insert=async(sql,values)=>{const [result]=await db.execute(sql,values);return result.insertId;};
+    const reject=async(sql,values,codes)=>{
+      let failure;
+      try { await db.execute(sql,values); } catch(error) { failure=error; }
+      if (!failure) throw new Error('Expected rejection missing: '+sql.split(' ').slice(0,3).join(' '));
+      if (!codes.includes(failure.code)) throw new Error('Unexpected rejection '+failure.code+' for '+sql.split(' ').slice(0,3).join(' '));
+    };
+    const userSql='INSERT INTO users(email,password_hash,full_name,role) VALUES (?,?,?,?)';
+    const faculty=await insert(userSql,[token+'-faculty@example.edu',hash,'QA Faculty','faculty']);
+    const students=[];
+    for(let n=0;n<4;n++) students.push(await insert(userSql,[token+'-'+n+'@example.edu',hash,'QA Student '+n,'student']));
+    await reject(userSql,[token+'-faculty@example.edu',hash,'Duplicate','student'],['ER_DUP_ENTRY']);
+    await reject(userSql,[token+'-null@example.edu',hash,null,'student'],['ER_BAD_NULL_ERROR']);
+    await reject(userSql,[token+'-plain@example.edu','plaintext','Invalid','student'],['ER_SIGNAL_EXCEPTION']);
+    await insert('INSERT INTO faculty_profiles(user_id,faculty_id,department,academic_position) VALUES (?,?,?,?)',[faculty,token,'College of Computer and Sciences','Instructor']);
+    await reject('INSERT INTO faculty_profiles(user_id,faculty_id,department,academic_position) VALUES (?,?,?,?)',[students[0],token+'-role','Department','Professor'],['ER_SIGNAL_EXCEPTION']);
+    const faculty2=await insert(userSql,[token+'-faculty2@example.edu',hash,'QA Faculty 2','faculty']);
+    await reject('INSERT INTO faculty_profiles(user_id,faculty_id,department,academic_position) VALUES (?,?,?,?)',[faculty2,token,'Department','Professor'],['ER_DUP_ENTRY']);
+    const studentSql='INSERT INTO student_profiles(user_id,student_id,program,year_level,section) VALUES (?,?,?,?,?)';
+    for(let n=0;n<4;n++) await insert(studentSql,[students[n],'00-'+token+'-'+n,'BSIT',3,'BSIT 3-1']);
+    await reject(studentSql,[faculty,'wrong-role','BSIT',3,'BSIT 3-1'],['ER_SIGNAL_EXCEPTION']);
+    const studentExtra=await insert(userSql,[token+'-extra@example.edu',hash,'QA Extra','student']);
+    await reject(studentSql,[studentExtra,'00-'+token+'-0','BSIT',3,'BSIT 3-1'],['ER_DUP_ENTRY']);
+    await reject(studentSql,[studentExtra,'invalid-year','BSIT',5,'BSIT 3-1'],['ER_SIGNAL_EXCEPTION']);
+    await insert(studentSql,[studentExtra,'extra-'+token,'BSIT',3,'BSIT 3-1']);
+    await reject('UPDATE users SET role=? WHERE id=?',['faculty',students[0]],['ER_SIGNAL_EXCEPTION']);
+    const code='CL-'+crypto.randomBytes(3).toString('hex').toUpperCase();
+    const classSql='INSERT INTO classes(faculty_user_id,class_name,section,class_code,meet_link) VALUES (?,?,?,?,?)';
+    const classId=await insert(classSql,[faculty,'QA Class','BSIT 3-1',code,'https://meet.google.com/abc-defg-hij']);
+    await reject(classSql,[faculty,'Duplicate','BSIT 3-1',code,'https://meet.google.com/abc-defg-hij'],['ER_DUP_ENTRY']);
+    await reject(classSql,[students[0],'Wrong owner','BSIT 3-1','CL-000001','https://meet.google.com/abc-defg-hij'],['ER_NO_REFERENCED_ROW_2','ER_NO_REFERENCED_ROW']);
+    for(const student of students) await insert('INSERT INTO enrollments(class_id,student_user_id) VALUES (?,?)',[classId,student]);
+    await reject('INSERT INTO enrollments(class_id,student_user_id) VALUES (?,?)',[classId,students[0]],['ER_DUP_ENTRY']);
+    await reject('INSERT INTO enrollments(class_id,student_user_id) VALUES (?,?)',[classId,faculty],['ER_NO_REFERENCED_ROW_2','ER_NO_REFERENCED_ROW']);
+    await reject('INSERT INTO enrollments(class_id,student_user_id) VALUES (?,?)',[0,students[0]],['ER_NO_REFERENCED_ROW_2','ER_NO_REFERENCED_ROW']);
+    const sessionSql='INSERT INTO sessions(class_id,status,started_at,ended_at) VALUES (?,?,?,?)';
+    const session=await insert(sessionSql,[classId,'Live','2026-10-14 00:00:00.000',null]);
+    await reject(sessionSql,[classId,'Live','2026-10-14 01:00:00.000',null],['ER_DUP_ENTRY']);
+    await reject(sessionSql,[classId,'Completed','2026-10-14 01:00:00.000','2026-10-14 00:00:00.000'],['ER_SIGNAL_EXCEPTION']);
+    for(const student of students) await insert('INSERT INTO attendance(session_id,student_user_id) VALUES (?,?)',[session,student]);
+    const [[rosterBeforeJoin]]=await db.execute('SELECT COUNT(*) AS count FROM attendance WHERE session_id=? AND status=?',[session,'Not Joined']);
+    const [[joinedBeforeJoin]]=await db.execute('SELECT COUNT(*) AS count FROM session_participants WHERE session_id=?',[session]);
+    assert.equal(rosterBeforeJoin.count,4);assert.equal(joinedBeforeJoin.count,0);
+    const otherSession=await insert(sessionSql,[classId,'Completed','2026-10-13 00:00:00.000','2026-10-13 01:00:00.000']);
+    await insert('INSERT INTO attendance(session_id,student_user_id,status) VALUES (?,?,?)',[otherSession,studentExtra,'Absent']);
+    await reject('INSERT INTO attendance(session_id,student_user_id) VALUES (?,?)',[session,students[0]],['ER_DUP_ENTRY']);
+    await reject('UPDATE attendance SET status=? WHERE session_id=? AND student_user_id=?',['Absent',session,students[2]],['ER_SIGNAL_EXCEPTION']);
+    const participantSql='INSERT INTO session_participants(session_id,student_user_id,first_joined_at,last_joined_at,participation_status,connection_status) VALUES (?,?,?,?,?,?)';
+    const first='2026-10-14 00:14:59.999';
+    const participant=await insert(participantSql,[session,students[0],first,first,'Joined','Online']);
+    await insert(participantSql,[session,students[1],'2026-10-14 00:15:00.000','2026-10-14 00:15:00.000','Joined','Online']);
+    await reject(participantSql,[session,studentExtra,first,first,'Joined','Online'],['ER_NO_REFERENCED_ROW_2','ER_NO_REFERENCED_ROW']);
+    await reject('UPDATE session_participants SET first_joined_at=? WHERE id=?',['2026-10-14 00:16:00.000',participant],['ER_SIGNAL_EXCEPTION']);
+    await db.execute('UPDATE session_participants SET participation_status=?,last_left_at=? WHERE id=?',['Left','2026-10-14 00:20:00.000',participant]);
+    await db.execute('UPDATE session_participants SET participation_status=?,last_joined_at=? WHERE id=?',['Joined','2026-10-14 00:25:00.000',participant]);
+    const [[joined]]=await db.execute("SELECT DATE_FORMAT(first_joined_at,'%Y-%m-%d %H:%i:%s.%f') AS first FROM session_participants WHERE id=?",[participant]);
+    assert.equal(joined.first,'2026-10-14 00:14:59.999000');
+    await db.execute('UPDATE attendance SET status=? WHERE session_id=? AND student_user_id=?',['Present',session,students[0]]);
+    await db.execute('UPDATE attendance SET status=? WHERE session_id=? AND student_user_id=?',['Late',session,students[1]]);
+    const interval=await insert('INSERT INTO session_connection_intervals(participant_id,connected_at) VALUES (?,?)',[participant,first]);
+    await reject('INSERT INTO session_connection_intervals(participant_id,connected_at) VALUES (?,?)',[participant,first],['ER_DUP_ENTRY']);
+    await reject('UPDATE session_connection_intervals SET disconnected_at=? WHERE id=?',['2026-10-14 00:00:00.000',interval],['ER_SIGNAL_EXCEPTION']);
+    await db.execute('UPDATE session_connection_intervals SET disconnected_at=? WHERE id=?',['2026-10-14 00:20:00.000',interval]);
+    await insert('INSERT INTO session_connection_intervals(participant_id,connected_at) VALUES (?,?)',[participant,'2026-10-14 00:25:00.000']);
+    await db.execute('UPDATE sessions SET status=?,ended_at=? WHERE id=?',['Completed','2026-10-14 01:00:00.000',session]);
+    await reject(participantSql,[session,students[3],'2026-10-14 01:01:00.000','2026-10-14 01:01:00.000','Joined','Online'],['ER_SIGNAL_EXCEPTION']);
+    await db.execute('UPDATE attendance SET status=?,finalized_at=? WHERE session_id=? AND student_user_id=?',['Absent','2026-10-14 01:00:00.000',session,students[2]]);
+    const [statuses]=await db.execute('SELECT status FROM attendance WHERE session_id=?',[session]);
+    assert.deepEqual(statuses.map(row=>row.status).sort(),['Absent','Late','Not Joined','Present']);
+    const logSql='INSERT INTO activity_logs(session_id,student_user_id,event_type,occurred_at) VALUES (?,?,?,?)';
+    await reject(logSql,[session,studentExtra,'Student Joined',first],['ER_NO_REFERENCED_ROW_2','ER_NO_REFERENCED_ROW']);
+    await reject(logSql,[0,students[0],'Student Joined',first],['ER_NO_REFERENCED_ROW_2','ER_NO_REFERENCED_ROW']);
+    await insert(logSql,[session,students[0],'Student Rejoined','2026-10-14 00:25:00.000']);
+    await insert(logSql,[session,students[0],'Student Joined',first]);
+    await insert(logSql,[session,null,'Session Started','2026-10-14 00:00:00.000']);
+    const [logs]=await db.execute('SELECT event_type FROM activity_logs WHERE session_id=? ORDER BY occurred_at,id',[session]);
+    assert.deepEqual(logs.map(row=>row.event_type),['Session Started','Student Joined','Student Rejoined']);
+    await reject('DELETE FROM users WHERE id=?',[faculty],['ER_ROW_IS_REFERENCED_2','ER_ROW_IS_REFERENCED']);
+    await db.rollback();
+    for(const name of names){const [[row]]=await db.query(`SELECT COUNT(*) AS count FROM \`${name}\``);assert.equal(row.count,before[name],`Test rows must roll back in ${name}`);}
+    console.log('PASS: uniqueness, NOT NULL, roles, string IDs, year levels, class/session relationships, roster references, rejoin/immutable first join, attendance state storage, connection intervals, chronological logs and rollback preservation.');
+  } finally { await db.rollback(); db.release(); }
+}
+verify().catch(error=>{ console.error(error.code ? `Database verification failed [${error.code}]` : error.message); if (error.code === 'ERR_ASSERTION') console.error(error.stack.split('\n').filter(line => line.includes('at verify')).join('\n')); process.exitCode=1; }).finally(()=>pool.end());

@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Classence Student",
+  "version": "0.7.4",
+  "description": "Classence student classes, sessions and consent-based Google Meet monitoring.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0JUCR3iMBhgoylA4saNowXQkh/WxxsvuJz8PXCCHBUbCAEJnIo+XajyKkMvl9AAhrjVB668z1lECwMzGhCFN7ZppLMSsYggBYTjlJsxpI7omYWGoLgoe9c3RAytLNsf128NDFO4B5i3pWHwC0948A3Y6btIJsXXgYAmlZpU/cDxuV0vKrEslRXpahbZJAf9PJTsUBEGGCppnjaP8Hb4i/s0kSQrKMGimSpuSEUSbtywHhprXY9yNhkM5qFX5zN+30U2dQvMDCKZeRdyQntJBcL5ugglVRpTmx5BFP1jtnePlNR+H+TvI0lMi7zwOPlopGuYTca59+Q8aqnzeBcIriQIDAQAB",
+  "action": {
+    "default_title": "Classence Student",
+    "default_popup": "index.html"
+  },
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "https://meet.google.com/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:* ws://127.0.0.1:*"
+  },
+  "permissions": [
+    "storage",
+    "alarms"
+  ],
+  "minimum_chrome_version": "120",
+  "background": {
+    "service_worker": "js/background.js"
+  }
+}

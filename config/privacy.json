@@ -1,0 +1,26 @@
+{
+  "noticeVersion": "classence-student-privacy-local-2",
+  "institution": "[PENDING INSTITUTIONAL CONFIGURATION: institution / data controller]",
+  "privacyContact": "[PENDING INSTITUTIONAL APPROVAL: privacy contact and request channel]",
+  "lawfulBasis": "[PENDING INSTITUTIONAL APPROVAL: basis for each processing purpose]",
+  "retentionPolicy": "[PENDING INSTITUTIONAL APPROVAL: category-specific retention and exceptions]",
+  "requestProcedure": "[PENDING INSTITUTIONAL APPROVAL: authorized reviewers, response process and escalation]",
+  "policyApproved": false,
+  "retention": {
+    "approvalReference": null,
+    "approved": false,
+    "days": {
+      "account": null,
+      "enrollment": null,
+      "participation": null,
+      "monitoring": null,
+      "attendance": null,
+      "attendanceAudit": null,
+      "authentication": null,
+      "credentialRecovery": null,
+      "privacyRequests": null,
+      "privacyAudit": null,
+      "backups": null
+    }
+  }
+}

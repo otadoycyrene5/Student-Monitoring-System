@@ -1,0 +1,32 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="classence-api" content="http://127.0.0.1:3000">
+  <title>Student | Classence</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="js/model.js" defer></script>
+  <script src="js/ui.js" defer></script>
+  <script src="js/api.js" defer></script>
+  <script src="js/vendor/socket.io.min.js" defer></script>
+  <script src="js/monitoring-popup.js" defer></script>
+  <script src="js/realtime.js" defer></script>
+  <script src="js/privacy.js" defer></script>
+  <script src="js/script.js" defer></script>
+</head>
+<body class="student-preview">
+  <div id="app"></div>
+  <noscript>This interactive prototype requires JavaScript.</noscript>
+  <dialog id="confirmation" aria-labelledby="confirmation-title" aria-describedby="confirmation-text">
+    <h2 id="confirmation-title"></h2>
+    <p id="confirmation-text"></p>
+    <div class="toolbar">
+      <form method="dialog"><button type="submit" class="secondary">Cancel</button></form>
+      <button type="button" data-confirm>Confirm</button>
+    </div>
+  </dialog>
+  <dialog id="student-profile-dialog" aria-labelledby="student-profile-title"></dialog>
+</body>
+</html>
+
