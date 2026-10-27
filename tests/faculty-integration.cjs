@@ -1,0 +1,74 @@
+'use strict';
+require('dotenv').config({path:require('node:path').join(__dirname,'..','.env'),quiet:true});
+const fs=require('node:fs'),path=require('node:path'),http=require('node:http'),assert=require('node:assert/strict'),crypto=require('node:crypto');
+const pool=require('../src/config/database'),{setup}=require('../src/index');
+const chromePipe=require('./chrome-pipe.cjs');
+(async()=>{
+  const db=await pool.getConnection();let api,preview,page,chrome,realtime;
+  const original={origin:process.env.CLIENT_ORIGIN,register:process.env.AUTH_REGISTER_LIMIT,login:process.env.AUTH_LOGIN_LIMIT};
+  try{
+    const before={};for(const table of ['users','faculty_profiles','student_profiles','auth_sessions']){const [[r]]=await db.query('SELECT COUNT(*) AS count FROM `'+table+'`');before[table]=r.count;}
+    await db.beginTransaction();
+    const testPool={execute:(...args)=>db.execute(...args),query:(...args)=>db.query(...args),getConnection:async()=>({execute:(...args)=>db.execute(...args),query:(...args)=>db.query(...args),beginTransaction:()=>db.query('SAVEPOINT integration_registration'),commit:()=>db.query('RELEASE SAVEPOINT integration_registration'),rollback:()=>db.query('ROLLBACK TO SAVEPOINT integration_registration'),release(){}})};
+    process.env.CLIENT_ORIGIN='http://127.0.0.1:8000';process.env.AUTH_REGISTER_LIMIT='100';process.env.AUTH_LOGIN_LIMIT='100';
+    const instance=setup({pool:testPool});api=instance.app.listen(0,'127.0.0.1');await new Promise(r=>api.once('listening',r));realtime=await require('../src/realtime').attachRealtime(api,testPool,[process.env.CLIENT_ORIGIN],{lockName:'faculty_integration_'+crypto.randomUUID(),reconcileClassIds:['18446744073709551615']});instance.app.locals.realtime=realtime;
+    const base='http://127.0.0.1:'+api.address().port,front=path.resolve(__dirname,'../../frontend');
+    preview=http.createServer((req,res)=>{let relative=decodeURIComponent(new URL(req.url,'http://localhost').pathname);if(relative.endsWith('/'))relative+='index.html';const file=path.resolve(front,'.'+relative);if(!file.startsWith(front+path.sep)){res.writeHead(403);return res.end();}try{let content=fs.readFileSync(file);if(file.endsWith('/index.html')||file.endsWith('\\index.html'))content=content.toString().replace('content="http://127.0.0.1:3000"','content="'+base+'"');res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':file.endsWith('.html')?'text/html':'image/jpeg');res.end(content);}catch{res.writeHead(404);res.end();}}).listen(8000,'127.0.0.1');await new Promise(r=>preview.once('listening',r));
+    chrome=await chromePipe();page=await chrome.open('http://127.0.0.1:8000/teacher/',base);page.send=page.command;
+    Object.defineProperty(page,'errors',{get:()=>chrome.events.filter(e=>e.method==='Runtime.exceptionThrown').map(e=>e.params.exceptionDetails.text)});
+    const setInput=page.input;page.input=async(selector,value)=>{await setInput(selector,value);await page.evaluate('document.querySelector('+JSON.stringify(selector)+').dispatchEvent(new Event("input",{bubbles:true}))');};
+    await page.send('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});await page.send('Emulation.setEmulatedMedia',{features:[{name:'prefers-reduced-motion',value:'reduce'}]});
+    await page.wait('typeof FacultyAPI!=="undefined" && !FacultyAPI.checking');assert(await page.evaluate('!!document.querySelector("[data-form=login]")'));
+    await page.evaluate('localStorage.setItem("classwatch-demo-v2","original prototype preserved");localStorage.setItem("cw-teacher","fake-local-identity");render()');
+    assert(await page.evaluate('!!document.querySelector("[data-form=login]")'));
+    const id=crypto.randomUUID(),email='faculty-'+id+'@example.edu',password='IntegrationPass123!';
+    const fill=async(overrides={})=>{const values={facultyId:'FAC-'+id,name:'Prof. Integration Faculty',department:'College of Computer and Sciences',academicRank:'Instructor',email,password,confirm:password,...overrides};for(const [key,value]of Object.entries(values))await page.input('#'+key,value);await page.evaluate('document.querySelector("#agreement").checked=true');};
+    const submit=async()=>{await page.wait('!FacultyRegistration.busy');await page.evaluate('document.querySelector("form[data-form]").requestSubmit()');};
+    await page.click('[data-action=auth-mode]');await submit();assert.equal(await page.evaluate('document.activeElement.id'),'facultyId');
+    assert(await page.evaluate('document.querySelector("#academicRank").required'));
+    await fill({academicRank:''});await submit();assert(await page.evaluate('document.querySelector("#academicRank-error").textContent.includes("position")'));
+    await fill({name:'x'.repeat(161)});await submit();await page.wait('document.querySelector("#name-error")?.textContent.includes("160")');
+    await fill({confirm:'different'});await submit();assert(await page.evaluate('document.querySelector("#confirm-error").textContent.includes("match")'));
+    await fill();await submit();await page.wait('!!document.querySelector(".registration-success")');
+    const [[user]]=await db.execute('SELECT u.id,f.faculty_id FROM users u JOIN faculty_profiles f ON f.user_id=u.id WHERE u.email=?',[email]);assert(user);assert.equal(user.faculty_id,'FAC-'+id);
+    await page.click('[data-action=auth-mode]');await page.click('[data-action=auth-mode]');await fill({facultyId:'DIFFERENT-'+id});await submit();await page.wait('document.querySelector("#registration-feedback")?.textContent.includes("already registered")');
+    await fill({email:'duplicate-id-'+id+'@example.edu'});await submit();await page.wait('document.querySelector("#registration-feedback")?.textContent.includes("already registered")');
+    await page.click('[data-action=auth-mode]');await page.input('#email',email);await page.input('#password','wrongpass');await submit();await page.wait('document.querySelector("#feedback")?.textContent.includes("Invalid")');
+    await page.input('#email','unknown-'+id+'@example.edu');await submit();await page.wait('document.querySelector("#feedback")?.textContent.includes("Invalid")');
+    await page.input('#email',email);await page.input('#password',password);await submit();await page.wait('document.querySelector("h1")?.textContent==="Overview"');
+    assert(await page.evaluate('!document.cookie.includes("classence_faculty_session")'));
+    const cookies=await page.send('Network.getAllCookies');const cookie=cookies.cookies.find(c=>c.name==='classence_faculty_session');assert(cookie.httpOnly);assert.equal(cookie.sameSite,'Strict');
+    assert(await page.evaluate('localStorage.getItem("classwatch-demo-v2")==="original prototype preserved"'));
+    assert.equal(await page.evaluate('myClasses().length'),0);
+    await page.click('[data-page=profile]');await page.wait('document.querySelector("h1")?.textContent==="My Profile"');assert(await page.evaluate('document.querySelector(".profile-details").textContent.includes("FAC-'+id+'")'));
+    await page.send('Page.reload');await page.wait('document.querySelector("h1")?.textContent==="My Profile"');
+    assert.equal(await page.evaluate('FacultyAPI.current.name'),'Prof. Integration Faculty');
+    await page.click('[data-page=classes]');await page.wait('document.querySelector("h1")?.textContent==="My Classes"');await page.click('[data-page=create]');await page.wait('!!document.querySelector("[data-form=class]")');await page.input('#name','Integration Class');await page.input('#section','BSIT 3-1');await page.input('#meet','https://meet.google.com/abc-defg-hij');await page.evaluate('document.querySelector("[data-form=class]").requestSubmit()');await page.wait('document.querySelector(".class-title-row")?.textContent.includes("Integration Class")');
+    await page.click('[data-page=edit]');await page.wait('document.querySelector("#faculty-records-dialog").open');await page.input('#records-name','Edited Class');await page.evaluate('document.querySelector("[data-records-form=class]").requestSubmit()');await page.wait('!document.querySelector("#faculty-records-dialog").open');
+    await page.click('[data-action=start]');await page.wait('!!document.querySelector("[data-rt=end]")');await page.click('[data-rt=end]');await page.wait('!document.querySelector("[data-rt=end]")');
+    await page.click('[data-page=profile]');assert.equal(await page.evaluate('!!document.querySelector("[data-action=reset]")'),false);
+    assert(await page.evaluate('!Object.values(localStorage).some(value=>value.includes('+JSON.stringify(password)+'))'));
+    for(const [width,height]of [[1440,900],[768,1024],[375,812]]){await page.send('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:false});for(const view of ['dashboard','classes','details','monitor','attendance','logs','profile']){await page.evaluate(`navigate('${view}','c1','history-demo')`);assert(await page.evaluate('document.documentElement.scrollWidth<=innerWidth'));}}
+    await page.send('Emulation.setDeviceMetricsOverride',{width:1440,height:900,deviceScaleFactor:1,mobile:false});
+    await page.click('[data-action=logout]');await page.wait('!!document.querySelector("[data-form=login]")');assert(!(await page.send('Network.getAllCookies')).cookies.some(c=>c.name==='classence_faculty_session'));
+    const revoked=await fetch(base+'/api/auth/me',{headers:{Authorization:'Bearer '+cookie.value}});assert.equal(revoked.status,401);
+    const secondEmail='second-'+id+'@example.edu';
+    const secondRegistration=await fetch(base+'/api/auth/faculty/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({facultyId:'SECOND-'+id,fullName:'Second Faculty',department:'College of Computer and Sciences',academicPosition:'Professor',email:secondEmail,password})});assert.equal(secondRegistration.status,201);
+    await page.input('#email',secondEmail);await page.input('#password',password);await submit();await page.wait('FacultyAPI.current?.name==="Second Faculty"');assert.equal(await page.evaluate('myClasses().length'),0);
+    await page.click('[data-action=logout]');await page.wait('!!document.querySelector("[data-form=login]")');
+    await page.input('#email',email);await page.input('#password',password);await submit();await page.wait('FacultyAPI.current?.name==="Prof. Integration Faculty"');await page.wait('myClasses().length===1');
+    await page.click('[data-action=logout]');await page.wait('!!document.querySelector("[data-form=login]")');
+
+    const studentEmail='student-'+id+'@example.edu';await fetch(base+'/api/auth/student/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({studentId:'ST-'+id,fullName:'Integration Student',program:'BSIT',yearLevel:3,section:'BSIT 3-1',email:studentEmail,password})});
+    await page.input('#email',studentEmail);await page.input('#password',password);await submit();await page.wait('document.querySelector("#feedback")?.textContent.includes("Faculty account")');assert(await page.evaluate('!FacultyAPI.current'));
+    await page.input('#email',email);await submit();await page.wait('!!FacultyAPI.current');
+    await db.execute('UPDATE session_families SET absolute_expires_at=DATE_SUB(UTC_TIMESTAMP(3),INTERVAL 1 SECOND) WHERE user_id=? AND revoked_at IS NULL',[user.id]);await page.click('[data-page=profile]');await page.wait('!!document.querySelector("[data-form=login]")');
+    await page.input('#email',email);await page.input('#password',password);await submit();await page.wait('!!FacultyAPI.current');
+    if(realtime){await realtime.close();realtime=null;}await new Promise(r=>{api.close(r);api.closeAllConnections();});api=null;await page.click('[data-action=logout]');await page.wait('document.querySelector("#feedback")?.textContent.includes("revocation could not be confirmed")');
+    await page.send('Page.reload');await page.wait('typeof FacultyAPI!=="undefined" && !FacultyAPI.checking && !!document.querySelector("[data-form=login]")');assert(await page.evaluate('!FacultyAPI.current'));
+    await page.input('#email',email);await page.input('#password',password);await submit();await page.wait('document.querySelector("#feedback")?.textContent.includes("Cannot connect")');
+    assert(await page.evaluate('localStorage.getItem("classwatch-demo-v2")==="original prototype preserved"'));
+    assert.deepEqual(page.errors,[]);console.log('PASS: real browser registration/MySQL inserts, duplicates, confirmation, login errors, HttpOnly restoration, private profile, database-backed class/edit/session/modal/responsive flows, student rejection, expiry, logout/revocation and network failure.');
+    await db.rollback();for(const table of Object.keys(before)){const [[r]]=await db.query('SELECT COUNT(*) AS count FROM `'+table+'`');assert.equal(r.count,before[table]);}console.log('PASS: database fixtures rolled back; pre-existing browser storage preserved.');
+  }catch(error){if(page)console.log(await page.evaluate('({heading:document.querySelector("h1")?.textContent,feedback:document.querySelector("#feedback")?.textContent,checking:window.FacultyAPI?.checking,authenticated:Boolean(window.FacultyAPI?.current),toast:document.querySelector("#notification-toast")?.textContent,errors:document.querySelector("#registration-feedback")?.textContent})'));throw error;}finally{if(chrome)await chrome.close();if(realtime)await realtime.close();for(const s of [api,preview])if(s)await new Promise(r=>{s.close(r);s.closeAllConnections();});await db.rollback();db.release();await pool.end();process.env.CLIENT_ORIGIN=original.origin;process.env.AUTH_REGISTER_LIMIT=original.register;process.env.AUTH_LOGIN_LIMIT=original.login;}
+})().catch(error=>{console.error('Faculty integration tests failed:',error.code||error.message);process.exitCode=1});

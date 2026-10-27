@@ -1,0 +1,85 @@
+'use strict';
+require('dotenv').config({path:require('node:path').join(__dirname,'../.env'),quiet:true});
+const assert=require('node:assert/strict'),crypto=require('node:crypto'),http=require('node:http');
+const {io:client}=require('socket.io-client'),pool=require('../src/config/database');
+const {createAuthService}=require('../src/services/authService'),{createLiveService}=require('../src/services/liveService');
+const {attachRealtime,socketPath}=require('../src/realtime'),{setup}=require('../src/index');
+const pause=ms=>new Promise(r=>setTimeout(r,ms));
+(async()=>{
+  const db=await pool.getConnection(),sockets=[];let server,realtime;
+  const tables=['users','faculty_profiles','student_profiles','auth_sessions','classes','enrollments','sessions','attendance','session_participants','session_connection_intervals','activity_logs'],before={};
+  const original=process.env.CLIENT_ORIGIN;
+  try{
+    for(const t of tables){const [[r]]=await db.query('SELECT COUNT(*) n FROM `'+t+'`');before[t]=r.n;}await db.beginTransaction();
+    const testPool={execute:(...a)=>db.execute(...a),query:(...a)=>db.query(...a),getConnection:async()=>({execute:(...a)=>db.execute(...a),query:(...a)=>db.query(...a),beginTransaction:()=>db.query('SAVEPOINT realtime_work'),commit:()=>db.query('RELEASE SAVEPOINT realtime_work'),rollback:()=>db.query('ROLLBACK TO SAVEPOINT realtime_work'),release(){}})};
+    const auth=createAuthService(testPool,900),live=createLiveService(testPool),uid=crypto.randomUUID(),password='RealtimeIntegration123!';
+    const users=[];
+    for(const [i,role]of ['faculty','faculty','student','student','student'].entries())users.push(await auth.register(role,{email:`rt-${i}-${uid}@example.edu`,password,fullName:'Realtime '+i,facultyId:'F-'+i+'-'+uid,department:'Computing',academicPosition:'Professor',studentId:'S-'+i+'-'+uid,program:'BSIT',yearLevel:3,section:'BSIT 3-1'}));
+    const sessions=[];for(const user of users)sessions.push(await auth.login({email:user.email,password}));
+    const identities=[];for(const s of sessions)identities.push(await auth.authenticate(s.accessToken));
+    const c=await live.create(identities[0],{name:'Realtime Class',section:'BSIT 3-1',meet:'https://meet.google.com/abc-defg-hij'}),other=await live.create(identities[1],{name:'Other Class',section:'BSIT 3-1',meet:'https://meet.google.com/abc-defg-hij'});
+    await live.enroll(identities[2],{code:c.code});await live.enroll(identities[3],{code:c.code});await live.enroll(identities[4],{code:other.code});
+    const origin='http://127.0.0.1:5500',extension='chrome-extension://jefdcdmlgafknafmpdondeglcbimdnki';process.env.CLIENT_ORIGIN=origin+','+extension;
+    const instance=setup({pool:testPool});server=http.createServer(instance.app);
+    const config={lockName:'rt_test_'+uid,reconcileClassIds:[c.classId,other.classId]};
+    realtime=await attachRealtime(server,testPool,[origin,extension],config);instance.app.locals.realtime=realtime;
+    await new Promise(r=>server.listen(0,'127.0.0.1',r));let base='http://127.0.0.1:'+server.address().port;
+    async function connect(index,extra={}){
+      const faculty=index<2,token=sessions[index]?.accessToken;
+      const socket=client(base,{path:socketPath,transports:['websocket'],reconnection:false,forceNew:true,auth:faculty?{client:'faculty-web'}:{token},extraHeaders:{Origin:faculty?origin:extension,...(faculty?{Cookie:'classence_faculty_session='+token}:{}),...extra.headers},...extra.options});sockets.push(socket);
+      await new Promise((resolve,reject)=>{socket.once('connect',resolve);socket.once('connect_error',reject);});return socket;
+    }
+    const call=(socket,event,value={})=>new Promise((resolve,reject)=>socket.timeout(4000).emit(event,value,(timeout,result)=>timeout?reject(timeout):resolve(result)));
+    const ok=async(...args)=>{const r=await call(...args);assert(r.ok,JSON.stringify(r));return r.data;};
+    const no=async(...args)=>{const r=await call(...args);assert.equal(r.ok,false);return r.error;};
+    const wait=async(check)=>{for(let i=0;i<100;i++){if(await check())return;await pause(40);}throw new Error('Timed out waiting for real-time state.');};
+    const faculty=await connect(0),student=await connect(2),student2=await connect(3),unrelated=await connect(4);
+    for(const token of [undefined,'invalid','0'.repeat(64)])await assert.rejects(connect(2,{options:{auth:{token}}}));
+    await assert.rejects(connect(2,{headers:{Origin:'https://untrusted.example'}}));
+    await assert.rejects(connect(0,{headers:{Origin:extension}}));
+    await assert.rejects(connect(2,{options:{auth:{token:sessions[0].accessToken,role:'student'}}}));
+    console.log('PASS: Faculty cookie and Student bearer handshake, missing/invalid credentials, untrusted origin and injected role rejection.');
+    await ok(faculty,'faculty:join-class',{classId:c.classId});await no(faculty,'faculty:join-class',{classId:other.classId});await no(student,'faculty:start-session',{classId:c.classId});
+    await no(student,'student:join-session',{sessionId:'1',userId:users[3].id});
+    const foreign=await connect(1);await ok(foreign,'faculty:join-class',{classId:other.classId});let leaked=0;foreign.on('participant:connected',()=>leaked++);unrelated.on('participant:connected',()=>leaked++);await ok(unrelated,'realtime:sync');
+    const started=await Promise.all([ok(faculty,'faculty:start-session',{classId:c.classId}),ok(faculty,'faculty:start-session',{classId:c.classId})]);assert.equal(started[0].sessionId,started[1].sessionId);const sid=started[0].sessionId;
+    await no(unrelated,'student:join-session',{sessionId:sid});await no(foreign,'faculty:end-session',{sessionId:sid});
+    let updates=0;faculty.on('participant:connected',()=>updates++);
+    await ok(student,'realtime:sync');await ok(student2,'realtime:sync');
+    await Promise.all([ok(student,'student:join-session',{sessionId:sid}),ok(student,'student:join-session',{sessionId:sid}),ok(student2,'student:join-session',{sessionId:sid})]);
+    assert(updates>=2);assert.equal(leaked,0);
+    let data=await ok(faculty,'realtime:sync'),active=data.classes[0].sessions[0];assert.equal(active.participants.length,2);assert(active.participants.every(p=>p.connection==='Online'));
+    const studentData=await ok(student,'realtime:sync');assert.equal(studentData.classes.length,1);assert.equal(studentData.classes[0].sessions[0].participants.length,1);assert(!studentData.classes[0].students);
+    const [[first]]=await db.execute('SELECT id,first_joined_at FROM session_participants WHERE session_id=? AND student_user_id=?',[sid,users[2].id]);
+    const duplicate=await connect(2);await ok(duplicate,'student:join-session',{sessionId:sid});student.disconnect();await pause(100);await realtime.serial(()=>{});
+    const state=async()=>{const [[r]]=await db.execute('SELECT * FROM session_participants WHERE id=?',[first.id]);return r;};
+    assert.equal((await state()).connection_status,'Online');
+    duplicate.disconnect();await wait(async()=>{await realtime.serial(()=>{});return (await state()).connection_status==='Offline';});assert.equal((await state()).participation_status,'Joined');
+    const reconnected=await connect(2);await ok(reconnected,'student:join-session',{sessionId:sid});assert.equal((await state()).first_joined_at.getTime(),first.first_joined_at.getTime());
+    const parallel=await connect(2);await ok(parallel,'student:join-session',{sessionId:sid});await ok(reconnected,'student:leave-session',{sessionId:sid});assert.equal((await state()).connection_status,'Offline');assert.equal((await state()).participation_status,'Left');
+    parallel.disconnect();await realtime.serial(()=>{});await ok(reconnected,'student:join-session',{sessionId:sid});
+    const [[counts]]=await db.execute('SELECT COUNT(*) n FROM session_connection_intervals WHERE participant_id=? AND disconnected_at IS NULL',[first.id]);assert.equal(counts.n,1);
+    const [[pcount]]=await db.execute('SELECT COUNT(*) n FROM session_participants WHERE session_id=? AND student_user_id=?',[sid,users[2].id]);assert.equal(pcount.n,1);
+    const [[attendance]]=await db.execute('SELECT status,finalized_at FROM attendance WHERE session_id=? AND student_user_id=?',[sid,users[2].id]);assert.equal(attendance.status,'Present');assert.equal(attendance.finalized_at,null);
+    console.log('PASS: ownership/enrollment, concurrent idempotent start/join, two Students, authorized updates, room/privacy isolation, multisocket disconnect/leave/rejoin, immutable first join, one open interval, automatic Present based on immutable first join.');
+
+    const logout=await fetch(base+'/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+sessions[3].accessToken},body:'{}'});assert.equal(logout.status,200);await wait(()=>!student2.connected);
+    await assert.rejects(connect(3));
+    await db.execute('UPDATE auth_sessions SET expires_at=DATE_SUB(UTC_TIMESTAMP(3),INTERVAL 1 SECOND) WHERE user_id=?',[users[2].id]);await assert.rejects(connect(2));await wait(()=>!reconnected.connected);
+    const renewed=await auth.login({email:users[2].email,password});sessions[2]=renewed;const short=await auth.login({email:users[3].email,password});sessions[3]=short;
+    await db.execute('UPDATE auth_sessions SET expires_at=DATE_ADD(UTC_TIMESTAMP(3),INTERVAL 1 SECOND) WHERE token_hash=UNHEX(SHA2(?,256))',[short.accessToken]);const expiring=await connect(3);await wait(()=>!expiring.connected);
+    console.log('PASS: REST logout revocation, revoked/expired handshake rejection, active socket expiry/revocation disconnect and private room removal.');
+    const liveStudent=await connect(2);await ok(liveStudent,'student:join-session',{sessionId:sid});await ok(faculty,'faculty:end-session',{sessionId:sid});await ok(faculty,'faculty:end-session',{sessionId:sid});await no(liveStudent,'student:join-session',{sessionId:sid});
+    assert.equal((await state()).connection_status,'Offline');
+    const next=await ok(faculty,'faculty:start-session',{classId:c.classId});await ok(liveStudent,'student:join-session',{sessionId:next.sessionId});
+    await realtime.close();realtime=null;
+
+    await db.execute("UPDATE session_participants SET connection_status='Online' WHERE session_id=?",[next.sessionId]);const [[stale]]=await db.execute('SELECT id FROM session_participants WHERE session_id=?',[next.sessionId]);await db.execute('INSERT INTO session_connection_intervals(participant_id,connected_at) VALUES (?,UTC_TIMESTAMP(3))',[stale.id]);
+    server=http.createServer(instance.app);realtime=await attachRealtime(server,testPool,[origin,extension],config);instance.app.locals.realtime=realtime;await new Promise(r=>server.listen(0,'127.0.0.1',r));base='http://127.0.0.1:'+server.address().port;
+    const [[repaired]]=await db.execute('SELECT connection_status FROM session_participants WHERE id=?',[stale.id]);assert.equal(repaired.connection_status,'Offline');const [[intervals]]=await db.execute('SELECT COUNT(*) n FROM session_connection_intervals WHERE participant_id=? AND disconnected_at IS NULL',[stale.id]);assert.equal(intervals.n,0);
+    const afterRestart=await connect(2);await ok(afterRestart,'student:join-session',{sessionId:next.sessionId});const afterFaculty=await connect(0);data=await ok(afterFaculty,'realtime:sync');assert.equal(data.classes[0].sessions[0].participants[0].connection,'Online');
+    const bucket=Array.from(realtime.io.sockets.sockets.values()).find(s=>String(s.data.identity.userId)===String(users[2].id));bucket.data.bucket.count=60;assert.equal((await no(afterRestart,'realtime:sync')).code,'RATE_LIMITED');
+    console.log('PASS: idempotent session end, ended-session rejoin rejection, persistent history, graceful cleanup, crash-stale reconciliation, restart/rejoin snapshot and event rate limiting.');
+    await realtime.close();realtime=null;await db.rollback();for(const t of tables){const [[r]]=await db.query('SELECT COUNT(*) n FROM `'+t+'`');assert.equal(r.n,before[t],t+' row count must be preserved after rollback');}console.log('PASS: all real-time fixtures rolled back; original records preserved.');
+  }finally{for(const s of sockets)s.disconnect();if(realtime)await realtime.close();else if(server?.listening)await new Promise(r=>server.close(r));await db.rollback();db.release();await pool.end();process.env.CLIENT_ORIGIN=original;}
+})().catch(e=>{console.error('Real-time tests failed:',e.code||'',e.message);if(e.stack)console.error(e.stack.split('\n').filter(x=>x.includes('realtime.cjs')).join('\n'));process.exitCode=1;});
